@@ -9,14 +9,20 @@ import { useFhevm, useEncrypt, useDecrypt } from '../fhevm-sdk/src';
 interface SurveyData {
   id: string;
   title: string;
-  question: string;
-  encryptedResponse: string;
-  publicValue1: number;
-  publicValue2: number;
+  description: string;
+  encryptedResponses: number;
+  publicResponses: number;
   timestamp: number;
   creator: string;
-  isVerified?: boolean;
+  isVerified: boolean;
   decryptedValue?: number;
+}
+
+interface SurveyStats {
+  totalSurveys: number;
+  activeSurveys: number;
+  totalResponses: number;
+  avgCompletion: number;
 }
 
 const App: React.FC = () => {
@@ -31,65 +37,56 @@ const App: React.FC = () => {
     status: "pending", 
     message: "" 
   });
-  const [newSurveyData, setNewSurveyData] = useState({ title: "", question: "", response: "" });
+  const [newSurveyData, setNewSurveyData] = useState({ title: "", description: "", responseCount: "" });
   const [selectedSurvey, setSelectedSurvey] = useState<SurveyData | null>(null);
-  const [decryptedResponse, setDecryptedResponse] = useState<number | null>(null);
-  const [isDecrypting, setIsDecrypting] = useState(false);
-  const [contractAddress, setContractAddress] = useState("");
-  const [fhevmInitializing, setFhevmInitializing] = useState(false);
-  const [stats, setStats] = useState({ total: 0, verified: 0, avgScore: 0 });
   const [searchTerm, setSearchTerm] = useState("");
+  const [operationHistory, setOperationHistory] = useState<string[]>([]);
+  const [stats, setStats] = useState<SurveyStats>({
+    totalSurveys: 0,
+    activeSurveys: 0,
+    totalResponses: 0,
+    avgCompletion: 0
+  });
 
   const { status, initialize, isInitialized } = useFhevm();
   const { encrypt, isEncrypting } = useEncrypt();
-  const { verifyDecryption, isDecrypting: fheIsDecrypting } = useDecrypt();
+  const { verifyDecryption, isDecrypting } = useDecrypt();
 
   useEffect(() => {
-    const initFhevmAfterConnection = async () => {
-      if (!isConnected || isInitialized || fhevmInitializing) return;
-      
+    const initFhevm = async () => {
+      if (!isConnected || isInitialized) return;
       try {
-        setFhevmInitializing(true);
         await initialize();
       } catch (error) {
-        setTransactionStatus({ 
-          visible: true, 
-          status: "error", 
-          message: "FHEVM initialization failed" 
-        });
-        setTimeout(() => setTransactionStatus({ visible: false, status: "pending", message: "" }), 3000);
-      } finally {
-        setFhevmInitializing(false);
+        console.error('FHEVM init failed:', error);
       }
     };
-
-    initFhevmAfterConnection();
-  }, [isConnected, isInitialized, initialize, fhevmInitializing]);
+    initFhevm();
+  }, [isConnected, isInitialized, initialize]);
 
   useEffect(() => {
-    const loadDataAndContract = async () => {
+    const loadData = async () => {
       if (!isConnected) {
         setLoading(false);
         return;
       }
-      
       try {
-        await loadData();
-        const contract = await getContractReadOnly();
-        if (contract) setContractAddress(await contract.getAddress());
+        await loadSurveys();
       } catch (error) {
-        console.error('Failed to load data:', error);
+        console.error('Load failed:', error);
       } finally {
         setLoading(false);
       }
     };
-
-    loadDataAndContract();
+    loadData();
   }, [isConnected]);
 
-  const loadData = async () => {
+  const addToHistory = (action: string) => {
+    setOperationHistory(prev => [`${new Date().toLocaleTimeString()}: ${action}`, ...prev.slice(0, 9)]);
+  };
+
+  const loadSurveys = async () => {
     if (!isConnected) return;
-    
     setIsRefreshing(true);
     try {
       const contract = await getContractReadOnly();
@@ -104,22 +101,22 @@ const App: React.FC = () => {
           surveysList.push({
             id: businessId,
             title: businessData.name,
-            question: businessData.description,
-            encryptedResponse: businessId,
+            description: businessData.description,
+            encryptedResponses: Number(businessData.publicValue1) || 0,
+            publicResponses: Number(businessData.publicValue2) || 0,
             timestamp: Number(businessData.timestamp),
             creator: businessData.creator,
-            publicValue1: Number(businessData.publicValue1) || 0,
-            publicValue2: Number(businessData.publicValue2) || 0,
             isVerified: businessData.isVerified,
             decryptedValue: Number(businessData.decryptedValue) || 0
           });
         } catch (e) {
-          console.error('Error loading survey data:', e);
+          console.error('Error loading survey:', e);
         }
       }
       
       setSurveys(surveysList);
       updateStats(surveysList);
+      addToHistory(`Loaded ${surveysList.length} surveys`);
     } catch (e) {
       setTransactionStatus({ visible: true, status: "error", message: "Failed to load data" });
       setTimeout(() => setTransactionStatus({ visible: false, status: "pending", message: "" }), 3000);
@@ -129,10 +126,17 @@ const App: React.FC = () => {
   };
 
   const updateStats = (surveyList: SurveyData[]) => {
-    const total = surveyList.length;
-    const verified = surveyList.filter(s => s.isVerified).length;
-    const avgScore = total > 0 ? surveyList.reduce((sum, s) => sum + s.publicValue1, 0) / total : 0;
-    setStats({ total, verified, avgScore });
+    const totalSurveys = surveyList.length;
+    const activeSurveys = surveyList.filter(s => Date.now()/1000 - s.timestamp < 604800).length;
+    const totalResponses = surveyList.reduce((sum, s) => sum + s.encryptedResponses + s.publicResponses, 0);
+    const avgCompletion = totalSurveys > 0 ? totalResponses / totalSurveys : 0;
+
+    setStats({
+      totalSurveys,
+      activeSurveys,
+      totalResponses,
+      avgCompletion
+    });
   };
 
   const createSurvey = async () => {
@@ -147,119 +151,94 @@ const App: React.FC = () => {
     
     try {
       const contract = await getContractWithSigner();
-      if (!contract) throw new Error("Failed to get contract with signer");
+      if (!contract) throw new Error("No contract");
       
-      const responseValue = parseInt(newSurveyData.response) || 0;
+      const responseCount = parseInt(newSurveyData.responseCount) || 0;
       const businessId = `survey-${Date.now()}`;
       
-      const encryptedResult = await encrypt(contractAddress, address, responseValue);
+      const encryptedResult = await encrypt(await contract.getAddress(), address, responseCount);
       
       const tx = await contract.createBusinessData(
         businessId,
         newSurveyData.title,
         encryptedResult.encryptedData,
         encryptedResult.proof,
-        parseInt(newSurveyData.response) || 0,
+        responseCount,
         0,
-        newSurveyData.question
+        newSurveyData.description
       );
       
-      setTransactionStatus({ visible: true, status: "pending", message: "Waiting for transaction confirmation..." });
+      setTransactionStatus({ visible: true, status: "pending", message: "Waiting for transaction..." });
       await tx.wait();
       
       setTransactionStatus({ visible: true, status: "success", message: "Survey created successfully!" });
-      setTimeout(() => {
-        setTransactionStatus({ visible: false, status: "pending", message: "" });
-      }, 2000);
+      addToHistory(`Created survey: ${newSurveyData.title}`);
       
-      await loadData();
+      await loadSurveys();
       setShowCreateModal(false);
-      setNewSurveyData({ title: "", question: "", response: "" });
+      setNewSurveyData({ title: "", description: "", responseCount: "" });
     } catch (e: any) {
-      const errorMessage = e.message?.includes("user rejected transaction") 
-        ? "Transaction rejected" 
-        : "Submission failed";
+      const errorMessage = e.message?.includes("user rejected") ? "Transaction rejected" : "Creation failed";
       setTransactionStatus({ visible: true, status: "error", message: errorMessage });
-      setTimeout(() => setTransactionStatus({ visible: false, status: "pending", message: "" }), 3000);
     } finally { 
       setCreatingSurvey(false); 
     }
   };
 
-  const decryptData = async (businessId: string): Promise<number | null> => {
+  const decryptData = async (surveyId: string): Promise<number | null> => {
     if (!isConnected || !address) return null;
     
-    setIsDecrypting(true);
     try {
       const contractRead = await getContractReadOnly();
       if (!contractRead) return null;
       
-      const businessData = await contractRead.getBusinessData(businessId);
-      if (businessData.isVerified) {
-        const storedValue = Number(businessData.decryptedValue) || 0;
-        setTransactionStatus({ visible: true, status: "success", message: "Data already verified" });
-        setTimeout(() => setTransactionStatus({ visible: false, status: "pending", message: "" }), 2000);
-        return storedValue;
+      const surveyData = await contractRead.getBusinessData(surveyId);
+      if (surveyData.isVerified) {
+        return Number(surveyData.decryptedValue) || 0;
       }
       
       const contractWrite = await getContractWithSigner();
       if (!contractWrite) return null;
       
-      const encryptedValueHandle = await contractRead.getEncryptedValue(businessId);
+      const encryptedValueHandle = await contractRead.getEncryptedValue(surveyId);
       
       const result = await verifyDecryption(
         [encryptedValueHandle],
-        contractAddress,
+        await contractRead.getAddress(),
         (abiEncodedClearValues: string, decryptionProof: string) => 
-          contractWrite.verifyDecryption(businessId, abiEncodedClearValues, decryptionProof)
+          contractWrite.verifyDecryption(surveyId, abiEncodedClearValues, decryptionProof)
       );
       
-      setTransactionStatus({ visible: true, status: "pending", message: "Verifying decryption..." });
-      
       const clearValue = result.decryptionResult.clearValues[encryptedValueHandle];
-      
-      await loadData();
-      
-      setTransactionStatus({ visible: true, status: "success", message: "Data decrypted successfully!" });
-      setTimeout(() => {
-        setTransactionStatus({ visible: false, status: "pending", message: "" });
-      }, 2000);
+      await loadSurveys();
+      addToHistory(`Decrypted survey: ${surveyId}`);
       
       return Number(clearValue);
       
     } catch (e: any) { 
-      if (e.message?.includes("Data already verified")) {
-        setTransactionStatus({ visible: true, status: "success", message: "Data is already verified" });
-        setTimeout(() => setTransactionStatus({ visible: false, status: "pending", message: "" }), 2000);
-        await loadData();
-        return null;
-      }
-      
       setTransactionStatus({ visible: true, status: "error", message: "Decryption failed" });
-      setTimeout(() => setTransactionStatus({ visible: false, status: "pending", message: "" }), 3000);
       return null; 
-    } finally { 
-      setIsDecrypting(false); 
     }
   };
 
-  const checkAvailability = async () => {
+  const handleCheckAvailability = async () => {
     try {
       const contract = await getContractReadOnly();
-      if (!contract) return;
-      
-      const available = await contract.isAvailable();
-      setTransactionStatus({ visible: true, status: "success", message: "System is available!" });
-      setTimeout(() => setTransactionStatus({ visible: false, status: "pending", message: "" }), 2000);
+      if (contract) {
+        const available = await contract.isAvailable();
+        if (available) {
+          setTransactionStatus({ visible: true, status: "success", message: "FHE system is available!" });
+          addToHistory("Checked FHE system availability");
+        }
+      }
     } catch (e) {
       setTransactionStatus({ visible: true, status: "error", message: "Availability check failed" });
-      setTimeout(() => setTransactionStatus({ visible: false, status: "pending", message: "" }), 3000);
     }
   };
 
   const filteredSurveys = surveys.filter(survey =>
     survey.title.toLowerCase().includes(searchTerm.toLowerCase()) ||
-    survey.question.toLowerCase().includes(searchTerm.toLowerCase())
+    survey.description.toLowerCase().includes(searchTerm.toLowerCase())
   );
 
   if (!isConnected) {
@@ -268,28 +247,27 @@ const App: React.FC = () => {
         <header className="app-header">
           <div className="logo">
             <h1>SurveyChain FHE 🔐</h1>
+            <p>Confidential Survey Tool</p>
           </div>
-          <div className="header-actions">
-            <ConnectButton accountStatus="address" chainStatus="icon" showBalance={false}/>
-          </div>
+          <ConnectButton />
         </header>
         
         <div className="connection-prompt">
           <div className="connection-content">
-            <div className="connection-icon">🔐</div>
-            <h2>Connect Your Wallet</h2>
-            <p>Please connect your wallet to access the confidential survey system.</p>
+            <div className="connection-icon">🔒</div>
+            <h2>Connect Wallet to Access Encrypted Surveys</h2>
+            <p>Your survey responses are protected with Fully Homomorphic Encryption</p>
           </div>
         </div>
       </div>
     );
   }
 
-  if (!isInitialized || fhevmInitializing) {
+  if (!isInitialized) {
     return (
       <div className="loading-screen">
         <div className="fhe-spinner"></div>
-        <p>Initializing FHE System...</p>
+        <p>Initializing FHE Encryption System...</p>
       </div>
     );
   }
@@ -297,290 +275,285 @@ const App: React.FC = () => {
   if (loading) return (
     <div className="loading-screen">
       <div className="fhe-spinner"></div>
-      <p>Loading survey system...</p>
+      <p>Loading encrypted surveys...</p>
     </div>
   );
 
   return (
     <div className="app-container">
       <header className="app-header">
-        <div className="logo">
-          <h1>SurveyChain FHE 🔐</h1>
-          <p>Confidential Survey Tool</p>
+        <div className="logo-section">
+          <h1>SurveyChain FHE</h1>
+          <span className="tagline">Confidential Surveys 🔐</span>
         </div>
         
         <div className="header-actions">
-          <button onClick={checkAvailability} className="check-btn">
-            Check System
+          <button className="availability-btn" onClick={handleCheckAvailability}>
+            Check FHE Status
           </button>
-          <button onClick={() => setShowCreateModal(true)} className="create-btn">
-            + New Survey
-          </button>
-          <ConnectButton accountStatus="address" chainStatus="icon" showBalance={false}/>
+          <ConnectButton />
         </div>
       </header>
-      
+
       <div className="main-content">
-        <div className="stats-panels">
-          <div className="stat-panel">
-            <h3>Total Surveys</h3>
-            <div className="stat-value">{stats.total}</div>
+        <div className="stats-panel">
+          <div className="stat-card">
+            <div className="stat-value">{stats.totalSurveys}</div>
+            <div className="stat-label">Total Surveys</div>
           </div>
-          <div className="stat-panel">
-            <h3>Verified Responses</h3>
-            <div className="stat-value">{stats.verified}</div>
+          <div className="stat-card">
+            <div className="stat-value">{stats.activeSurveys}</div>
+            <div className="stat-label">Active</div>
           </div>
-          <div className="stat-panel">
-            <h3>Avg Score</h3>
-            <div className="stat-value">{stats.avgScore.toFixed(1)}</div>
+          <div className="stat-card">
+            <div className="stat-value">{stats.totalResponses}</div>
+            <div className="stat-label">Encrypted Responses</div>
+          </div>
+          <div className="stat-card">
+            <div className="stat-value">{stats.avgCompletion.toFixed(1)}</div>
+            <div className="stat-label">Avg Completion</div>
           </div>
         </div>
 
-        <div className="search-section">
-          <input
-            type="text"
-            placeholder="Search surveys..."
-            value={searchTerm}
-            onChange={(e) => setSearchTerm(e.target.value)}
-            className="search-input"
-          />
-          <button onClick={loadData} className="refresh-btn" disabled={isRefreshing}>
-            {isRefreshing ? "Refreshing..." : "Refresh"}
-          </button>
-        </div>
-
-        <div className="surveys-grid">
-          {filteredSurveys.length === 0 ? (
-            <div className="no-surveys">
-              <p>No surveys found</p>
-              <button onClick={() => setShowCreateModal(true)} className="create-btn">
-                Create First Survey
-              </button>
-            </div>
-          ) : (
-            filteredSurveys.map((survey, index) => (
-              <div 
-                className={`survey-card ${selectedSurvey?.id === survey.id ? "selected" : ""}`}
-                key={index}
-                onClick={() => setSelectedSurvey(survey)}
-              >
-                <div className="card-header">
-                  <h3>{survey.title}</h3>
-                  <span className={`status ${survey.isVerified ? "verified" : "pending"}`}>
-                    {survey.isVerified ? "✅ Verified" : "🔓 Pending"}
-                  </span>
-                </div>
-                <p className="question">{survey.question}</p>
-                <div className="card-footer">
-                  <span>Score: {survey.publicValue1}/10</span>
-                  <span>{new Date(survey.timestamp * 1000).toLocaleDateString()}</span>
-                </div>
-              </div>
-            ))
-          )}
-        </div>
-      </div>
-      
-      {showCreateModal && (
-        <ModalCreateSurvey 
-          onSubmit={createSurvey} 
-          onClose={() => setShowCreateModal(false)} 
-          creating={creatingSurvey} 
-          surveyData={newSurveyData} 
-          setSurveyData={setNewSurveyData}
-          isEncrypting={isEncrypting}
-        />
-      )}
-      
-      {selectedSurvey && (
-        <SurveyDetailModal 
-          survey={selectedSurvey} 
-          onClose={() => {
-            setSelectedSurvey(null);
-            setDecryptedResponse(null);
-          }} 
-          decryptedResponse={decryptedResponse}
-          isDecrypting={isDecrypting || fheIsDecrypting}
-          decryptData={() => decryptData(selectedSurvey.id)}
-        />
-      )}
-      
-      {transactionStatus.visible && (
-        <div className="transaction-modal">
-          <div className="transaction-content">
-            <div className={`transaction-icon ${transactionStatus.status}`}>
-              {transactionStatus.status === "pending" && <div className="fhe-spinner"></div>}
-              {transactionStatus.status === "success" && "✓"}
-              {transactionStatus.status === "error" && "✗"}
-            </div>
-            <div className="transaction-message">{transactionStatus.message}</div>
-          </div>
-        </div>
-      )}
-    </div>
-  );
-};
-
-const ModalCreateSurvey: React.FC<{
-  onSubmit: () => void; 
-  onClose: () => void; 
-  creating: boolean;
-  surveyData: any;
-  setSurveyData: (data: any) => void;
-  isEncrypting: boolean;
-}> = ({ onSubmit, onClose, creating, surveyData, setSurveyData, isEncrypting }) => {
-  const handleChange = (e: React.ChangeEvent<HTMLInputElement | HTMLTextAreaElement>) => {
-    const { name, value } = e.target;
-    if (name === 'response') {
-      const intValue = value.replace(/[^\d]/g, '');
-      setSurveyData({ ...surveyData, [name]: intValue });
-    } else {
-      setSurveyData({ ...surveyData, [name]: value });
-    }
-  };
-
-  return (
-    <div className="modal-overlay">
-      <div className="create-survey-modal">
-        <div className="modal-header">
-          <h2>New Confidential Survey</h2>
-          <button onClick={onClose} className="close-modal">&times;</button>
-        </div>
-        
-        <div className="modal-body">
-          <div className="fhe-notice">
-            <strong>FHE 🔐 Protection</strong>
-            <p>Survey responses are encrypted with Zama FHE technology</p>
-          </div>
-          
-          <div className="form-group">
-            <label>Survey Title *</label>
-            <input 
-              type="text" 
-              name="title" 
-              value={surveyData.title} 
-              onChange={handleChange} 
-              placeholder="Enter survey title..." 
-            />
-          </div>
-          
-          <div className="form-group">
-            <label>Survey Question *</label>
-            <textarea 
-              name="question" 
-              value={surveyData.question} 
-              onChange={handleChange} 
-              placeholder="Enter your question..." 
-              rows={3}
-            />
-          </div>
-          
-          <div className="form-group">
-            <label>Response (Integer 1-10) *</label>
-            <input 
-              type="number" 
-              min="1" 
-              max="10" 
-              name="response" 
-              value={surveyData.response} 
-              onChange={handleChange} 
-              placeholder="Enter response 1-10..." 
-            />
-            <div className="data-type-label">FHE Encrypted Integer</div>
-          </div>
-        </div>
-        
-        <div className="modal-footer">
-          <button onClick={onClose} className="cancel-btn">Cancel</button>
-          <button 
-            onClick={onSubmit} 
-            disabled={creating || isEncrypting || !surveyData.title || !surveyData.question || !surveyData.response} 
-            className="submit-btn"
-          >
-            {creating || isEncrypting ? "Encrypting..." : "Create Survey"}
-          </button>
-        </div>
-      </div>
-    </div>
-  );
-};
-
-const SurveyDetailModal: React.FC<{
-  survey: SurveyData;
-  onClose: () => void;
-  decryptedResponse: number | null;
-  isDecrypting: boolean;
-  decryptData: () => Promise<number | null>;
-}> = ({ survey, onClose, decryptedResponse, isDecrypting, decryptData }) => {
-  const handleDecrypt = async () => {
-    if (decryptedResponse !== null) return;
-    await decryptData();
-  };
-
-  return (
-    <div className="modal-overlay">
-      <div className="survey-detail-modal">
-        <div className="modal-header">
-          <h2>Survey Details</h2>
-          <button onClick={onClose} className="close-modal">&times;</button>
-        </div>
-        
-        <div className="modal-body">
-          <div className="survey-info">
-            <div className="info-item">
-              <span>Title:</span>
-              <strong>{survey.title}</strong>
-            </div>
-            <div className="info-item">
-              <span>Question:</span>
-              <strong>{survey.question}</strong>
-            </div>
-            <div className="info-item">
-              <span>Creator:</span>
-              <strong>{survey.creator.substring(0, 6)}...{survey.creator.substring(38)}</strong>
-            </div>
-            <div className="info-item">
-              <span>Date:</span>
-              <strong>{new Date(survey.timestamp * 1000).toLocaleDateString()}</strong>
-            </div>
-          </div>
-          
-          <div className="data-section">
-            <h3>Encrypted Response</h3>
-            
-            <div className="data-row">
-              <div className="data-label">Response Value:</div>
-              <div className="data-value">
-                {survey.isVerified && survey.decryptedValue ? 
-                  `${survey.decryptedValue} (Verified)` : 
-                  decryptedResponse !== null ? 
-                  `${decryptedResponse} (Decrypted)` : 
-                  "🔒 FHE Encrypted"
-                }
+        <div className="content-panel">
+          <div className="panel-header">
+            <h2>Encrypted Surveys</h2>
+            <div className="header-controls">
+              <div className="search-box">
+                <input 
+                  type="text" 
+                  placeholder="Search surveys..." 
+                  value={searchTerm}
+                  onChange={(e) => setSearchTerm(e.target.value)}
+                />
               </div>
               <button 
-                className={`decrypt-btn ${(survey.isVerified || decryptedResponse !== null) ? 'decrypted' : ''}`}
-                onClick={handleDecrypt} 
-                disabled={isDecrypting}
+                className="create-btn"
+                onClick={() => setShowCreateModal(true)}
               >
-                {isDecrypting ? "Decrypting..." : survey.isVerified ? "✅ Verified" : "🔓 Decrypt"}
+                + New Survey
+              </button>
+              <button 
+                className="refresh-btn"
+                onClick={loadSurveys}
+                disabled={isRefreshing}
+              >
+                {isRefreshing ? "↻" : "↻"}
               </button>
             </div>
+          </div>
+
+          <div className="surveys-grid">
+            {filteredSurveys.map((survey, index) => (
+              <div 
+                key={survey.id}
+                className="survey-card"
+                onClick={() => setSelectedSurvey(survey)}
+              >
+                <div className="survey-header">
+                  <h3>{survey.title}</h3>
+                  <span className={`status-badge ${survey.isVerified ? 'verified' : 'encrypted'}`}>
+                    {survey.isVerified ? '✅ Verified' : '🔒 Encrypted'}
+                  </span>
+                </div>
+                <p className="survey-desc">{survey.description}</p>
+                <div className="survey-meta">
+                  <span>Responses: {survey.encryptedResponses}</span>
+                  <span>{new Date(survey.timestamp * 1000).toLocaleDateString()}</span>
+                </div>
+                {survey.isVerified && survey.decryptedValue && (
+                  <div className="decrypted-value">
+                    Average Score: {survey.decryptedValue}
+                  </div>
+                )}
+              </div>
+            ))}
+          </div>
+
+          {filteredSurveys.length === 0 && (
+            <div className="empty-state">
+              <div className="empty-icon">📊</div>
+              <h3>No surveys found</h3>
+              <p>Create your first encrypted survey to get started</p>
+              <button 
+                className="create-btn"
+                onClick={() => setShowCreateModal(true)}
+              >
+                Create Survey
+              </button>
+            </div>
+          )}
+        </div>
+
+        <div className="history-panel">
+          <h3>Operation History</h3>
+          <div className="history-list">
+            {operationHistory.map((entry, index) => (
+              <div key={index} className="history-entry">
+                {entry}
+              </div>
+            ))}
+          </div>
+        </div>
+      </div>
+
+      {showCreateModal && (
+        <div className="modal-overlay">
+          <div className="create-modal">
+            <div className="modal-header">
+              <h2>Create New Survey</h2>
+              <button onClick={() => setShowCreateModal(false)}>×</button>
+            </div>
             
-            <div className="fhe-info">
-              <div className="fhe-icon">🔐</div>
-              <div>
-                <strong>FHE Protected Response</strong>
-                <p>Individual responses are encrypted. Only statistical analysis is possible.</p>
+            <div className="modal-body">
+              <div className="fhe-notice">
+                <span>🔐</span>
+                <p>Survey responses will be encrypted using FHE technology</p>
+              </div>
+
+              <div className="form-group">
+                <label>Survey Title</label>
+                <input 
+                  type="text" 
+                  value={newSurveyData.title}
+                  onChange={(e) => setNewSurveyData({...newSurveyData, title: e.target.value})}
+                  placeholder="Enter survey title..."
+                />
+              </div>
+
+              <div className="form-group">
+                <label>Description</label>
+                <textarea 
+                  value={newSurveyData.description}
+                  onChange={(e) => setNewSurveyData({...newSurveyData, description: e.target.value})}
+                  placeholder="Describe your survey..."
+                />
+              </div>
+
+              <div className="form-group">
+                <label>Expected Responses (Encrypted)</label>
+                <input 
+                  type="number" 
+                  value={newSurveyData.responseCount}
+                  onChange={(e) => setNewSurveyData({...newSurveyData, responseCount: e.target.value})}
+                  placeholder="Enter expected number of responses..."
+                />
+                <small>This value will be encrypted with FHE</small>
+              </div>
+            </div>
+
+            <div className="modal-footer">
+              <button 
+                onClick={() => setShowCreateModal(false)}
+                className="cancel-btn"
+              >
+                Cancel
+              </button>
+              <button 
+                onClick={createSurvey}
+                disabled={creatingSurvey || !newSurveyData.title}
+                className="submit-btn"
+              >
+                {creatingSurvey ? "Creating..." : "Create Survey"}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {selectedSurvey && (
+        <div className="modal-overlay">
+          <div className="survey-modal">
+            <div className="modal-header">
+              <h2>{selectedSurvey.title}</h2>
+              <button onClick={() => setSelectedSurvey(null)}>×</button>
+            </div>
+            
+            <div className="modal-body">
+              <div className="survey-info">
+                <p>{selectedSurvey.description}</p>
+                <div className="info-grid">
+                  <div className="info-item">
+                    <label>Creator</label>
+                    <span>{selectedSurvey.creator.substring(0, 8)}...{selectedSurvey.creator.substring(36)}</span>
+                  </div>
+                  <div className="info-item">
+                    <label>Created</label>
+                    <span>{new Date(selectedSurvey.timestamp * 1000).toLocaleString()}</span>
+                  </div>
+                  <div className="info-item">
+                    <label>Encrypted Responses</label>
+                    <span>{selectedSurvey.encryptedResponses}</span>
+                  </div>
+                  <div className="info-item">
+                    <label>Status</label>
+                    <span className={selectedSurvey.isVerified ? 'verified' : 'encrypted'}>
+                      {selectedSurvey.isVerified ? 'Verified' : 'Encrypted'}
+                    </span>
+                  </div>
+                </div>
+              </div>
+
+              {selectedSurvey.isVerified && selectedSurvey.decryptedValue && (
+                <div className="results-section">
+                  <h3>Statistical Results</h3>
+                  <div className="result-chart">
+                    <div className="chart-bar">
+                      <div 
+                        className="bar-fill" 
+                        style={{ width: `${Math.min(100, selectedSurvey.decryptedValue)}%` }}
+                      >
+                        Average Score: {selectedSurvey.decryptedValue}
+                      </div>
+                    </div>
+                  </div>
+                  <p className="result-note">
+                    🔐 Individual responses remain encrypted. Only statistical results are visible.
+                  </p>
+                </div>
+              )}
+
+              <div className="action-section">
+                <button 
+                  onClick={async () => {
+                    const result = await decryptData(selectedSurvey.id);
+                    if (result !== null) {
+                      setSelectedSurvey({...selectedSurvey, isVerified: true, decryptedValue: result});
+                    }
+                  }}
+                  disabled={isDecrypting || selectedSurvey.isVerified}
+                  className="decrypt-btn"
+                >
+                  {isDecrypting ? "Decrypting..." : selectedSurvey.isVerified ? "✅ Verified" : "🔓 Verify Results"}
+                </button>
               </div>
             </div>
           </div>
         </div>
-        
-        <div className="modal-footer">
-          <button onClick={onClose} className="close-btn">Close</button>
+      )}
+
+      {transactionStatus.visible && (
+        <div className={`transaction-toast ${transactionStatus.status}`}>
+          <div className="toast-content">
+            <span className="toast-icon">
+              {transactionStatus.status === "success" ? "✓" : 
+               transactionStatus.status === "error" ? "✕" : "⏳"}
+            </span>
+            {transactionStatus.message}
+          </div>
         </div>
-      </div>
+      )}
+
+      <footer className="app-footer">
+        <div className="footer-content">
+          <p>SurveyChain FHE - Protecting your privacy with Fully Homomorphic Encryption</p>
+          <div className="footer-links">
+            <a href="#faq">FAQ</a>
+            <a href="#docs">Documentation</a>
+            <a href="#privacy">Privacy Policy</a>
+          </div>
+        </div>
+      </footer>
     </div>
   );
 };
